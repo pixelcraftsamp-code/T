@@ -1,0 +1,185 @@
+import telebot
+from telebot import types
+import sqlite3
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+
+# --- КОНФИГУРАЦИЯ ---
+API_TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(API_TOKEN)
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+def init_db():
+    conn = sqlite3.connect('subs_manager.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, lang TEXT, currency TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS subs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, price REAL, end_date TEXT)')
+    conn.commit()
+    return conn, cursor
+
+db_conn, db_cursor = init_db()
+
+texts = {
+    'ru': {
+        'start': '👋 Выбери язык:',
+        'currency': '💰 Выбери валюту:',
+        'menu': '📊 *Твои подписки*\n\nТраты в месяц: {total} {curr}\n\nНажми ❌ для удаления или ➕ для добавления:',
+        'add_btn': '➕ Добавить новую',
+        'ask_name': '1️⃣ Введи название подписки:',
+        'ask_price': '2️⃣ Введи цену подписки:',
+        'ask_date': '3️⃣ Введи дату (ДД.ММ.ГГГГ):',
+        'remind': '⏰ *Внимание!* {name} заканчивается через {days} дн.',
+        'error': '❌ Ошибка в формате. Попробуй еще раз:',
+        'success': '✅ Подписка добавлена!'
+    },
+    'en': {
+        'start': '👋 Choose language:',
+        'currency': '💰 Choose currency:',
+        'menu': '📊 *Your Subscriptions*\n\nTotal spend: {total} {curr}',
+        'add_btn': '➕ Add New',
+        'ask_name': '1️⃣ Enter name:',
+        'ask_price': '2️⃣ Enter price:',
+        'ask_date': '3️⃣ Enter date (DD.MM.YYYY):',
+        'remind': '⏰ *Reminder!* {name} expires in {days} days.',
+        'error': '❌ Error. Try again:',
+        'success': '✅ Added!'
+    }
+}
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def safe_delete(chat_id, message_id):
+    try: bot.delete_message(chat_id, message_id)
+    except: pass
+
+def get_user_data(user_id):
+    db_cursor.execute("SELECT lang, currency FROM users WHERE id = ?", (user_id,))
+    return db_cursor.fetchone()
+
+def render_menu(chat_id, message_id, edit=True):
+    """Отрисовка основного интерфейса в одном сообщении"""
+    user = get_user_data(chat_id)
+    if not user: return
+    lang, curr = user
+    
+    db_cursor.execute("SELECT id, name, price FROM subs WHERE user_id = ?", (chat_id,))
+    subs = db_cursor.fetchall()
+    total = sum(s[2] for s in subs)
+    
+    markup = types.InlineKeyboardMarkup()
+    for s_id, name, price in subs:
+        markup.add(types.InlineKeyboardButton(f"❌ {name} ({price} {curr})", callback_data=f"del_{s_id}"))
+    markup.add(types.InlineKeyboardButton(texts[lang]['add_btn'], callback_data="add_sub"))
+    
+    if edit:
+        bot.edit_message_text(texts[lang]['menu'].format(total=total, curr=curr), 
+                             chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, texts[lang]['menu'].format(total=total, curr=curr), 
+                         reply_markup=markup, parse_mode="Markdown")
+
+# --- ОБРАБОТЧИКИ ---
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    safe_delete(message.chat.id, message.message_id)
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Русский 🇷🇺", callback_data="set_lang_ru"),
+               types.InlineKeyboardButton("English 🇬🇧", callback_data="set_lang_en"))
+    bot.send_message(message.chat.id, texts['ru']['start'], reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('set_lang_'))
+def set_language(call):
+    lang = call.data.split('_')[2]
+    db_cursor.execute("INSERT OR REPLACE INTO users (id, lang) VALUES (?, ?)", (call.from_user.id, lang))
+    db_conn.commit()
+    
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    btns = [types.InlineKeyboardButton(c, callback_data=f"set_cur_{c}") for c in ['RUB', 'USD', 'EUR']]
+    markup.add(*btns)
+    bot.edit_message_text(texts[lang]['currency'], call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('set_cur_'))
+def set_currency(call):
+    curr = call.data.split('_')[2]
+    db_cursor.execute("UPDATE users SET currency = ? WHERE id = ?", (curr, call.from_user.id))
+    db_conn.commit()
+    render_menu(call.message.chat.id, call.message.message_id)
+
+# --- ДОБАВЛЕНИЕ (РЕДАКТИРОВАНИЕ ОДНОГО СООБЩЕНИЯ) ---
+
+@bot.callback_query_handler(func=lambda call: call.data == "add_sub")
+def add_sub_init(call):
+    lang = get_user_data(call.from_user.id)[0]
+    bot.edit_message_text(texts[lang]['ask_name'], call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(call.message, process_name_step, lang, call.message.message_id)
+
+def process_name_step(message, lang, main_msg_id):
+    name = message.text
+    safe_delete(message.chat.id, message.message_id) # Удаляем ввод юзера
+    bot.edit_message_text(texts[lang]['ask_price'], message.chat.id, main_msg_id)
+    bot.register_next_step_handler(message, process_price_step, lang, main_msg_id, name)
+
+def process_price_step(message, lang, main_msg_id, name):
+    safe_delete(message.chat.id, message.message_id)
+    try:
+        price = float(message.text.replace(',', '.'))
+        bot.edit_message_text(texts[lang]['ask_date'], message.chat.id, main_msg_id)
+        bot.register_next_step_handler(message, process_date_step, lang, main_msg_id, name, price)
+    except:
+        bot.edit_message_text(texts[lang]['error'], message.chat.id, main_msg_id)
+        bot.register_next_step_handler(message, process_price_step, lang, main_msg_id, name)
+
+def process_date_step(message, lang, main_msg_id, name, price):
+    safe_delete(message.chat.id, message.message_id)
+    try:
+        date_text = message.text
+        datetime.strptime(date_text, "%d.%m.%Y")
+        
+        db_cursor.execute("INSERT INTO subs (user_id, name, price, end_date) VALUES (?, ?, ?, ?)",
+                          (message.from_user.id, name, price, date_text))
+        db_conn.commit()
+        
+        # Проверка на мгновенное уведомление (новым сообщением, т.к. это важно)
+        today = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = datetime.strptime(date_text, "%d.%m.%Y").replace(tzinfo=MOSCOW_TZ)
+        diff = (end_date - today).days
+        if diff == 10 or (1 <= diff <= 5):
+            bot.send_message(message.from_user.id, texts[lang]['remind'].format(name=name, days=diff), parse_mode="Markdown")
+            
+        render_menu(message.chat.id, main_msg_id)
+    except:
+        bot.edit_message_text(texts[lang]['error'], message.chat.id, main_msg_id)
+        bot.register_next_step_handler(message, process_date_step, lang, main_msg_id, name, price)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('del_'))
+def delete_sub(call):
+    sub_id = call.data.split('_')[1]
+    db_cursor.execute("DELETE FROM subs WHERE id = ?", (sub_id,))
+    db_conn.commit()
+    render_menu(call.message.chat.id, call.message.message_id)
+
+# --- ПЛАНИРОВЩИК (БЕЗ ИЗМЕНЕНИЙ) ---
+def send_daily_reminders():
+    db_cursor.execute("SELECT subs.id, subs.user_id, subs.name, subs.end_date, users.lang FROM subs JOIN users ON subs.user_id = users.id")
+    rows = db_cursor.fetchall()
+    today = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    for sub_id, user_id, name, date_str, lang in rows:
+        try:
+            end_date = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=MOSCOW_TZ)
+            diff = (end_date - today).days
+            if diff < 0:
+                new_date = (end_date + timedelta(days=30)).strftime("%d.%m.%Y")
+                db_cursor.execute("UPDATE subs SET end_date = ? WHERE id = ?", (new_date, sub_id))
+                db_conn.commit()
+            elif diff == 10 or (1 <= diff <= 5):
+                bot.send_message(user_id, texts[lang]['remind'].format(name=name, days=diff), parse_mode="Markdown")
+        except: continue
+
+scheduler = BackgroundScheduler(timezone=MOSCOW_TZ)
+scheduler.add_job(send_daily_reminders, 'cron', hour=10, minute=0)
+scheduler.start()
+
+if __name__ == '__main__':
+    bot.infinity_polling()
